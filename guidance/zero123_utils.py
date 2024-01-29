@@ -16,6 +16,10 @@ import sys
 sys.path.append('./')
 
 from zero123 import Zero123Pipeline
+
+import copy
+from diffusers.loaders import AttnProcsLayers
+from diffusers.models.attention_processor import LoRAAttnProcessor
 import os
 
 class Zero123(nn.Module):
@@ -50,6 +54,50 @@ class Zero123(nn.Module):
         self.alphas = self.scheduler.alphas_cumprod.to(self.device) # for convenience
 
         self.embeddings = None
+        
+        
+        ## LoRA
+        lora_lr = 1e-6
+        # Freeze the unet parameters before adding adapters
+        for param in self.unet.parameters():
+            param.requires_grad_(False)
+
+        # set up LoRA layers
+        self.unet_lora = copy.deepcopy(self.unet)
+
+        lora_attn_procs = {}
+        for name in self.unet_lora.attn_processors.keys():
+            cross_attention_dim = (
+                None
+                if name.endswith("attn1.processor")
+                else self.unet_lora.config.cross_attention_dim
+            )
+            if name.startswith("mid_block"):
+                hidden_size = self.unet_lora.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(self.unet_lora.config.block_out_channels))[
+                    block_id
+                ]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = self.unet_lora.config.block_out_channels[block_id]
+
+            lora_attn_procs[name] = LoRAAttnProcessor(
+                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
+            )
+
+        self.unet_lora.set_attn_processor(lora_attn_procs)
+
+        self.lora_layers = AttnProcsLayers(self.unet_lora.attn_processors).to(
+            self.device
+        )
+        self.lora_layers._load_state_dict_pre_hooks.clear()
+        self.lora_layers._state_dict_hooks.clear()
+        self.optimizer = torch.optim.Adam(self.lora_layers.parameters(), lr=lora_lr)
+
+        # LoRA loss
+        self.lora_loss = lambda lora_prediction, eps_gt, eps_predicted: F.mse_loss(lora_prediction, eps_gt)
 
     @torch.no_grad()
     def get_img_embeds(self, x):
@@ -62,8 +110,7 @@ class Zero123(nn.Module):
         self.embeddings = [c, v]
 
     @torch.no_grad()
-    def refine(self, pred_rgb, polar, azimuth, radius, 
-               guidance_scale=5, steps=50, strength=0.8,
+    def refine(self, pred_rgb, polar, azimuth, radius, guidance_scale=5, steps=50, strength=0.8,
         ):
 
         batch_size = pred_rgb.shape[0]
@@ -153,6 +200,25 @@ class Zero123(nn.Module):
         noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
+
+        ## Make LoRA update
+        noise_pred_lora = self.unet_lora(
+            torch.cat([x_in, vae_emb], dim=1),
+            t_in.to(self.unet.dtype),
+            encoder_hidden_states=cc_emb,
+        ).sample
+
+        noise_pred_uncond_lora, noise_pred_pos_lora = noise_pred_lora.chunk(2)
+        noise_pred_lora = noise_pred_uncond_lora + guidance_scale * (
+            noise_pred_pos_lora - noise_pred_uncond_lora
+        )
+        
+        self.optimizer.zero_grad()
+        lora_loss = F.mse_loss(noise_pred_lora, noise)
+        lora_loss.backward()
+        self.optimizer.step()
+
+        ## Standart Update
         grad = w * (noise_pred - noise)
         grad = torch.nan_to_num(grad)
 
