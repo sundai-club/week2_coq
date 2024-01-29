@@ -85,7 +85,7 @@ class StableDiffusion(nn.Module):
         
 
         ## LoRA
-        lora_lr = 1e-6
+        lora_lr = 3e-4
         # Freeze the unet parameters before adding adapters
         for param in self.unet.parameters():
             param.requires_grad_(False)
